@@ -1,0 +1,330 @@
+=================================
+== SNOWFLAKE_DEV.GENERIC_SCHEMA.TRANSPOSE_IDOES_DIAGNOSTICS(IDOES_REQUEST_ID VARCHAR, SUBJECT VARCHAR)
+-- this is the main procedure that outputs the transposed table for the requested subject - 'math', 'ela', or 'spanish'
+-- it involves calling 2 procedures to pull the data and rename the columns
+=================================
+
+DECLARE
+    row_count INTEGER;
+    str_gm VARCHAR;
+    ff_str_gm VARCHAR;
+BEGIN
+    -- stretch growth measure variables (removed for evaluacion)
+        str_gm := ' ,annual_stretch_growth_measure ';
+        ff_str_gm := ' ,fall_to_fall_stretch_growth_measure ';
+        
+    -- validation for subject variable
+    IF (upper(subject) = 'MATH' OR upper(subject) = 'ELA') THEN
+        NULL;
+    ELSEIF (upper(subject) = 'SPANISH') THEN
+        str_gm := ' ';
+        ff_str_gm := ' ';
+    ELSE        
+        RETURN 'ERROR: subject must be either ''ela'', ''math'', ''spanish''.';
+    END IF;
+    
+    -- pull idoes data for subject and create necessary tables
+    CALL snowflake_dev.generic_schema.idoes_diag_data_pull(
+        :idoes_requestid,
+        :subject
+    );
+
+    -- add window-specific prefixes to select columns
+    CALL snowflake_dev.generic_schema.idoes_diag_add_prefix();
+
+    -- join tables to create full transposed table
+    EXECUTE IMMEDIATE
+    'CREATE OR REPLACE TEMPORARY TABLE transposed_diagnostics AS
+        SELECT request_id
+            ,raw_student_id
+            ,student_grade
+            ,academic_year
+            ,external_account_id
+            ,school
+            ,school_id
+            ,sex
+            ,hispanic_or_latino
+            ,race
+            ,english_language_learner
+            ,special_education
+            ,economically_disadvantaged
+            ,migrant
+            ,annual_typical_growth_measure '
+            || str_gm || '
+            ,cross_sectional_inclusion
+            ,cohort_inclusion
+            ,base.*
+            ,fall.*
+            ,winter.*
+            ,spring.*
+            ,fall_to_fall_typical_growth_measure '
+            || ff_str_gm || '            
+        FROM snowflake_dev.generic_schema.static_columns as sc
+        INNER JOIN snowflake_dev.generic_schema.base_diagnostics as base
+            on raw_student_id = base_raw_student_id
+            and academic_year = base_academic_year
+        LEFT JOIN snowflake_dev.generic_schema.fall_diagnostics as fall
+            on raw_student_id = fall_raw_student_id
+            and academic_year = fall_academic_year
+        LEFT JOIN snowflake_dev.generic_schema.winter_diagnostics as winter
+            on raw_student_id = winter_raw_student_id
+            and academic_year = winter_academic_year
+        LEFT JOIN snowflake_dev.generic_schema.spring_diagnostics as spring
+            on raw_student_id = spring_raw_student_id 
+            and academic_year = spring_academic_year 
+        ';
+        
+        -- Drop unnecessary columns from table
+        EXECUTE IMMEDIATE
+        'ALTER TABLE transposed_diagnostics
+            DROP COLUMN base_raw_student_id
+                ,base_academic_year
+                ,fall_raw_student_id
+                ,fall_academic_year
+                ,winter_raw_student_id
+                ,winter_academic_year
+                ,spring_raw_student_id
+                ,spring_academic_year
+                ,base_rnum
+                ,fall_rnum
+                ,winter_rnum
+                ,spring_rnum
+            ';
+
+        -- Drop unnecessary tables
+        DROP TABLE IF EXISTS snowflake_dev.generic_schema.static_columns;
+        DROP TABLE IF EXISTS snowflake_dev.generic_schema.base_diagnostics;
+        DROP TABLE IF EXISTS snowflake_dev.generic_schema.fall_diagnostics;
+        DROP TABLE IF EXISTS snowflake_dev.generic_schema.winter_diagnostics;
+        DROP TABLE IF EXISTS snowflake_dev.generic_schema.spring_diagnostics;
+
+    -- Check row count and return error message as needed 
+    SELECT count(*) INTO :row_count FROM transposed_diagnostics;
+
+    IF (row_count = 0) THEN
+        RETURN 'WARNING: Resulting table is empty. Please confirm that the iDOES Request ID is correct. You may need to wait a couple hours before data is loaded into the readstore.';
+    ELSE 
+        RETURN 'Success! \n Transposed iDOES Diagnostic saved as temporary table TRANSPOSED_DIAGNOSTICS';
+    END IF;
+
+END;
+
+
+=================================
+== SNOWFLAKE_DEV.GENERIC_SCHEMA.TRANSPOSE_IDOES_DIAG_DATA_PULL(IDOES_REQUEST_ID VARCHAR, SUBJECT VARCHAR)
+-- this procedure pulls tables for the requested ID, subject for all four windows - base, fall, winter, spring
+=================================
+
+DECLARE 
+    subj_columns VARCHAR;
+    diag_table VARCHAR;
+    windows ARRAY; 
+    window VARCHAR;
+    window_filter VARCHAR;
+    window_table VARCHAR;
+    str_proj VARCHAR;
+    str_pct VARCHAR;
+    str_gm VARCHAR;
+    ff_str_gm VARCHAR;
+BEGIN
+    -- set up windows array: 
+    windows := STRTOK_TO_ARRAY('Fall,Winter,Spring,Base', ',');
+
+    -- set up stretch-related queries (to be removed if subject = spanish)
+    str_proj := ' ,Projection_If_Student_Achieves_Stretch_Growth ';
+    str_pct := ' ,nullif(Pct_Progress_Stretch_Growth,'''')::float as Pct_Progress_Stretch_Growth ';
+    str_gm := ' ,nullif(Annual_Stretch_Growth_Measure,'''')::number as Annual_Stretch_Growth_Measure ';
+    ff_str_gm := ' ,nullif(Fall_to_Fall_Stretch_Growth_Measure,'''')::number as Fall_to_Fall_Stretch_Growth_Measure ';
+
+
+    -- set up subject_specific columns: 
+    IF (upper(subject) = 'MATH') THEN
+        diag_table := 'readstore_navi.public.idoes_diag_math_student_raw_data';
+        subj_columns := ',quantile_measure 
+            ,quantile_range   
+            ,nullif(Number_and_Operations_scale_score,'''')::number as Number_and_Operations_scale_score
+            ,Number_and_Operations_placement
+            ,Number_and_Operations_relative_placement
+            ,Algebra_and_Algebraic_Thinking_scale_score::number as Algebra_and_Algebraic_Thinking_scale_score
+            ,Algebra_and_Algebraic_Thinking_placement
+            ,Algebra_and_Algebraic_Thinking_relative_placement
+            ,nullif(Measurement_and_Data_scale_score,'''')::number as Measurement_and_Data_scale_score
+            ,Measurement_and_Data_placement
+            ,Measurement_and_Data_relative_placement
+            ,Geometry_scale_score::number as Geometry_scale_score
+            ,Geometry_placement
+            ,Geometry_relative_placement
+            ,diagnostic_language
+            ,nullif(mid_on_grade_level_scale_score,'''')::number as mid_on_grade_level_scale_score     
+        ';
+    ELSEIF (upper(subject) = 'ELA') THEN 
+        diag_table := 'readstore_navi.public.idoes_diag_ela_student_raw_data';
+        subj_columns := ',lexile_measure
+            ,lexile_range  
+            ,nullif(Phonological_Awareness_scale_score,'''')::number as Phonological_Awareness_scale_score 
+            ,Phonological_Awareness_placement 
+            ,Phonological_Awareness_relative_placement 
+            ,nullif(Phonics_scale_score, '''')::number as Phonics_scale_score 
+            ,Phonics_placement 
+            ,Phonics_relative_placement 
+            ,nullif(High_Frequency_Words_scale_score,'''')::number as High_Frequency_Words_scale_score 
+            ,High_Frequency_Words_placement 
+            ,High_Frequency_Words_relative_placement 
+            ,Vocabulary_scale_score::number as Vocabulary_scale_score 
+            ,Vocabulary_placement 
+            ,Vocabulary_relative_placement 
+            ,nullif(Reading_Comprehension_Overall_scale_score,'''')::number as Reading_Comprehension_Overall_scale_score 
+            ,Reading_Comprehension_Overall_placement 
+            ,Reading_Comprehension_Overall_relative_placement 
+            ,Reading_Comprehension_Literature_scale_score::number as Reading_Comprehension_Literature_scale_score 
+            ,Reading_Comprehension_Literature_placement 
+            ,Reading_Comprehension_Literature_relative_placement 
+            ,Reading_Comprehension_Informational_Text_scale_score::number as Reading_Comprehension_Informational_Text_scale_score 
+            ,Reading_Comprehension_Informational_Text_placement 
+            ,Reading_Comprehension_Informational_Text_relative_placement
+            ,diagnostic_language
+            ,nullif(mid_on_grade_level_scale_score,'''')::number as mid_on_grade_level_scale_score
+            ,reading_difficulty_indicator_yn 
+        ';
+    ELSEIF (upper(subject) = 'SPANISH') THEN 
+        diag_table := 'readstore_navi.public.idoes_diag_spanish_student_raw_data';
+        subj_columns := ',lexile_measure
+            ,lexile_range  
+            ,nullif(Phonological_Awareness_scale_score, '''')::number as Phonological_Awareness_scale_score
+            ,Phonological_Awareness_placement 
+            ,Phonological_Awareness_relative_placement 
+            ,nullif(Phonics_scale_score, '''')::number as Phonics_scale_score
+            ,Phonics_placement 
+            ,Phonics_relative_placement 
+            ,Vocabulary_scale_score::number as Vocabulary_scale_score
+            ,Vocabulary_placement 
+            ,Vocabulary_relative_placement 
+            ,Comprehension_Overall_scale_score::number as Comprehension_Overall_scale_score
+            ,Comprehension_Overall_placement 
+            ,Comprehension_Overall_relative_placement 
+            ,diagnostic_language
+            ,nullif(mid_on_grade_level_scale_score,'''')::number as mid_on_grade_level_scale_score
+        ';
+        str_proj := ' ';
+        str_pct := ' ';
+        str_gm := ' ';
+        ff_str_gm := ' ';
+    ELSE 
+        RETURN 'ERROR: Subject must be ''math'', ''ela'', or ''spanish''. Please re-run procedure';
+    END IF;
+    
+    -- grab non-window specific columns 
+    EXECUTE IMMEDIATE
+    'CREATE OR REPLACE TABLE snowflake_dev.generic_schema.static_columns AS 
+        SELECT distinct requestid as request_id
+            ,raw_student_id
+            ,student_grade
+            ,academic_year
+            ,external_account_id
+            ,school
+            ,school_id
+            ,sex
+            ,hispanic_or_latino
+            ,race
+            ,english_language_learner
+            ,special_education
+            ,economically_disadvantaged
+            ,migrant
+            ,nullif(annual_typical_growth_measure,'''')::number as annual_typical_growth_measure '
+            || str_gm || '            
+            ,cross_sectional_inclusion
+            ,cohort_inclusion
+            ,nullif(fall_to_fall_typical_growth_measure,'''')::number as fall_to_fall_typical_growth_measure ' || 
+            ff_str_gm || 
+        ' FROM ' || diag_table || ' 
+        WHERE requestid = ''' || idoes_requestid || ''''
+    ;
+
+    -- cycle through each window and pull data
+    FOR w IN 0 TO ARRAY_SIZE(windows) - 1 DO
+        window := windows[w]::VARCHAR;
+
+        -- create window specific variables: 
+        IF (window = 'Base') THEN
+            window_filter := 'baseline_diagnostic_yn = ''Y''';
+            window_table := 'snowflake_dev.generic_schema.base_diagnostics';
+        ELSE 
+            window_filter := 'diagnostic_window = ''' || window || '''';
+            window_table := 'snowflake_dev.generic_schema.' || window || '_diagnostics';
+        END IF;
+        
+        EXECUTE IMMEDIATE
+        'CREATE OR REPLACE TABLE '|| window_table || ' AS 
+            SELECT raw_student_id
+                  ,academic_year
+                  ,start_date::date as start_date
+                  ,completion_date::date as completion_date
+                  ,assessment_grade
+                  ,baseline_diagnostic_yn
+                  ,duration_min::number as duration_min
+                  ,rush_flag
+                  ,overall_scale_score::number as overall_scale_score
+                  ,overall_placement
+                  ,overall_relative_placement
+                  ,percentile::number as percentile
+                  ,grouping'
+                  || subj_columns ||
+                ' ,proficiency_if_student_shows_no_additional_growth
+                  ,projection_if_student_achieves_typical_growth ' 
+                  || str_proj || 
+                  ' ,activity_id
+                  ,diagnostic_window
+                  ,standard_error::float as standard_error
+                  ,nullif(weeks_between_diagnostics,'''')::number as weeks_between_diagnostics
+                  ,nullif(diagnostic_gain,'''')::number as diagnostic_gain
+                  ,nullif(pct_progress_typical_growth,'''')::float as pct_progress_typical_growth '
+                  || str_pct || 
+                  ' ,growth_inclusion
+                  ,performance_inclusion
+                  ,row_number() over (partition by Raw_Student_ID, Academic_Year order by case when Baseline_Diagnostic_YN= ''Y'' then 1 else 0 end asc) as rnum
+             FROM ' || diag_table ||
+            ' WHERE requestid = ''' || idoes_requestid || ''' and ' || window_filter 
+            || ' QUALIFY rnum = 1'
+
+            ;
+
+    END FOR; -- End looping for each window
+
+    RETURN 'Success';
+END;
+
+
+
+=================================
+== SNOWFLAKE_DEV.GENERIC_SCHEMA.IDOES_DIAG_ADD_PREFIX
+-- this python procedure adds the window as a prefix to the columns from each window-specific SLF
+=================================
+
+import snowflake.snowpark as snowpark
+from snowflake.snowpark.functions import col
+
+def main(session: snowpark.Session): 
+    # Define tables and their prefixes
+    tables = {
+        'FALL_DIAGNOSTICS': 'FALL_',
+        'WINTER_DIAGNOSTICS': 'WINTER_',
+        'SPRING_DIAGNOSTICS': 'SPRING_',
+        'BASE_DIAGNOSTICS': 'BASE_'
+    }
+    
+    schema = "SNOWFLAKE_DEV.GENERIC_SCHEMA"
+    
+    # Process each table
+    for table_name, prefix in tables.items():
+        full_table_name = f"{schema}.{table_name}"
+        
+        # Read table
+        df = session.table(full_table_name)
+        
+        # Add prefix to all columns using Snowpark (no Pandas conversion)
+        renamed_df = df.select([col(c).alias(f"{prefix}{c}") for c in df.columns])
+        
+        # Overwrite the table
+        renamed_df.write.save_as_table(full_table_name, mode="overwrite")
+    
+    return "Success: All tables updated with prefixes"
